@@ -995,6 +995,19 @@ static bool ds4_model_is_glm53(void) {
     return DS4_MODEL_VARIANT == DS4_VARIANT_GLM53;
 }
 
+/* Float values per token in the residual state that crosses a layer
+ * boundary: the hidden state exchanged by distributed layer slices and
+ * read or written by the graphs when they take or return it.  DeepSeek and
+ * GLM 5.3 carry DS4_N_HC hyper-connection streams.  GLM 5.2 has no
+ * hyper-connections (n_hc == 0) and carries one plain row.  The graphs and
+ * the distributed transport must both size buffers from this function. */
+static uint64_t ds4_model_hidden_row_values(void) {
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA && !ds4_model_is_glm53()) {
+        return DS4_N_EMBD;
+    }
+    return (uint64_t)DS4_N_HC * DS4_N_EMBD;
+}
+
 static uint32_t directional_steering_layer_count(void) {
     if (DS4_N_LAYER <= DS4_N_NEXTN_PREDICT) return 0;
     return DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
@@ -54704,8 +54717,8 @@ static bool glm_graph_forward_tokens(
             ok = ds4_gpu_tensor_write(g->glm53 ? hc_cur : cur,
                                       0,
                                       input_hc,
-                                      (uint64_t)n_tokens * DS4_N_EMBD *
-                                          (g->glm53 ? DS4_N_HC : 1u) *
+                                      (uint64_t)n_tokens *
+                                          ds4_model_hidden_row_values() *
                                           sizeof(float)) != 0;
         } else {
             ok = glm_graph_stream_map_token(g, model, weights);
@@ -55666,8 +55679,8 @@ glm53_batch_attention_done:
         ok = ds4_gpu_tensor_read(g->glm53 ? hc_cur : cur,
                                  0,
                                  output_hc,
-                                 (uint64_t)n_tokens * DS4_N_EMBD *
-                                     (g->glm53 ? DS4_N_HC : 1u) *
+                                 (uint64_t)n_tokens *
+                                     ds4_model_hidden_row_values() *
                                      sizeof(float)) != 0;
     }
     if (ok && logits_out) {
@@ -55992,8 +56005,8 @@ static bool glm_graph_forward_indexed_tokens(
             ok = ds4_gpu_tensor_write(g->glm53 ? hc_cur : cur,
                                       0,
                                       input_hc,
-                                      (uint64_t)n_tokens * DS4_N_EMBD *
-                                          (g->glm53 ? DS4_N_HC : 1u) *
+                                      (uint64_t)n_tokens *
+                                          ds4_model_hidden_row_values() *
                                           sizeof(float)) != 0;
         } else {
             ok = glm_graph_stream_map_token(g, model, weights);
@@ -57377,8 +57390,8 @@ glm53_indexed_attention_done:
         ok = ds4_gpu_tensor_read(g->glm53 ? hc_cur : cur,
                                  0,
                                  output_hc,
-                                 (uint64_t)n_tokens * DS4_N_EMBD *
-                                     (g->glm53 ? DS4_N_HC : 1u) *
+                                 (uint64_t)n_tokens *
+                                     ds4_model_hidden_row_values() *
                                      sizeof(float)) != 0;
     }
     if (ok && logits_out) {
@@ -57970,8 +57983,7 @@ static bool glm_graph_forward_token(
         ok = ds4_gpu_tensor_write(g->glm53 ? g->hc_cur : g->cur,
                                   0,
                                   input_hc,
-                                  (uint64_t)DS4_N_EMBD *
-                                      (g->glm53 ? DS4_N_HC : 1u) *
+                                  ds4_model_hidden_row_values() *
                                       sizeof(float)) != 0;
     } else if (ok && static_decode_map) {
         if (!static_map_state_cache || !g->streaming_static_decode_map_current) {
@@ -58947,8 +58959,7 @@ glm53_attention_done:
         ok = ds4_gpu_tensor_read(g->glm53 ? g->hc_cur : g->cur,
                                  0,
                                  output_hc,
-                                 (uint64_t)DS4_N_EMBD *
-                                     (g->glm53 ? DS4_N_HC : 1u) *
+                                 ds4_model_hidden_row_values() *
                                      sizeof(float)) != 0;
     }
     if (ok && logits_out && !defer_completion) {
@@ -73245,6 +73256,21 @@ size_t ds4_test_compute_glm_entry_bytes_sum_with_sessions(
     return sum;
 }
 
+/* Distributed hidden-state row size for a built-in model shape, without
+ * loading a GGUF: 0 = DeepSeek V4 Flash, 1 = GLM 5.2, 2 = GLM 5.3 Flash. */
+uint64_t ds4_test_hidden_row_values(int shape_id) {
+    const ds4_shape saved_shape = g_ds4_shape;
+    switch (shape_id) {
+    case 0: g_ds4_shape = DS4_SHAPE_FLASH; break;
+    case 1: g_ds4_shape = DS4_SHAPE_GLM52; break;
+    case 2: g_ds4_shape = DS4_SHAPE_GLM53; break;
+    default: return 0;
+    }
+    const uint64_t values = ds4_engine_hidden_f32_values(NULL);
+    g_ds4_shape = saved_shape;
+    return values;
+}
+
 size_t ds4_test_glm_per_layer_kv_bytes(uint32_t layer, int ctx_size) {
     const ds4_shape saved_shape = g_ds4_shape;
     g_ds4_shape = DS4_SHAPE_GLM52;
@@ -75232,8 +75258,7 @@ uint32_t ds4_engine_layer_compress_ratio(ds4_engine *e, uint32_t layer) {
 
 uint64_t ds4_engine_hidden_f32_values(ds4_engine *e) {
     (void)e;
-    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) return DS4_N_EMBD;
-    return (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    return ds4_model_hidden_row_values();
 }
 
 bool ds4_engine_glm_layer_payload_bytes(ds4_engine *e,
@@ -77071,7 +77096,9 @@ int ds4_session_eval_output_head_from_hc(ds4_session *s,
 #else
     if (ds4_session_is_glm(s)) {
         ds4_glm_gpu_graph *gg = &s->glm_graph;
-        bool ok = ds4_gpu_tensor_write(gg->cur,
+        /* GLM 5.3 receives all hyper-connection streams; the output head
+         * collapses hc_cur, so the streams must land there, not in cur. */
+        bool ok = ds4_gpu_tensor_write(gg->glm53 ? gg->hc_cur : gg->cur,
                                        0,
                                        last_hc,
                                        hidden_dim * sizeof(float)) != 0;
@@ -77165,7 +77192,7 @@ static int ds4_session_glm_spec_cycle_impl(
     const bool timing = s->engine->glm_mtp_timing;
     const uint32_t dense_before = s->glm_dense_cache_len;
     const uint64_t hc_row_values =
-        (uint64_t)DS4_N_EMBD * (g->glm53 ? DS4_N_HC : 1u);
+        ds4_model_hidden_row_values();
     const uint64_t hc_row_bytes = hc_row_values * sizeof(float);
     if (!s->glm_mtp_hc) {
         s->glm_mtp_hc = malloc(2ull * hc_row_bytes);
@@ -78009,7 +78036,9 @@ int ds4_session_eval_layer_slice(ds4_session *s,
             return 1;
         }
 
-        const uint64_t hidden_dim = DS4_N_EMBD;
+        /* Per-token stride of input_hc/output_hc: GLM 5.3 rows carry all
+         * hyper-connection streams, GLM 5.2 rows one plain hidden row. */
+        const uint64_t hidden_dim = ds4_model_hidden_row_values();
 #ifdef DS4_ROCM_BUILD
         const bool rocm_layer_slice_token_decode =
             glm_graph_env_truthy(
